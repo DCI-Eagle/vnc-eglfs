@@ -3,7 +3,7 @@ TARGET   = qvnceglfs
 
 DEFINES += VNC_MAKEDLL
 
-QT += gui gui-private network
+QT += gui gui-private network quick
 
 CONFIG += hide_symbols
 CONFIG += silent

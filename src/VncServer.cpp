@@ -19,6 +19,50 @@
 Q_LOGGING_CATEGORY( logGrab, "vnceglfs.grab", QtCriticalMsg )
 Q_LOGGING_CATEGORY( logConnection, "vnceglfs.connection" )
 
+/*
+	There is an issue with EGL and Qt6 which makes it really really difficult
+	to grab the working framebuffer. In Qt5, the rendering was done directly
+	to a framebuffer, so it was possible to call glReadPixels in afterRendering
+	and the completely-rendered, about-to-be-swapped frame was present. In Qt6,
+	the scene graph manages the rendering pipeline and so the rendering happens
+	in a different buffer, which we have no visibility into. Furthermore, it's
+	not clear if the scene graph double-buffers or not. The consequence of all
+	this is that in Qt 6, when the VNC server calls glReadPixels, it will read
+	stale frame data -- one frame delayed, due to double-buffering.
+	
+	In experimentation, doing a glReadPixels after frameSwapped (instead of
+	afterRendering) did work, although this is highly driver dependent and
+	requires the following configuration (which may or may not be the default):
+		- EGL_SWAP_BEHAVIOR_PRESERVED_BIT bit set for EGL_SURFACE_TYPE attribute
+		when calling eglChooseConfig
+		- EGL_SWAP_BEHAVIOR attribute set for EGL_BUFFER_PRESERVED when calling
+		eglSurfaceAttrib
+	Qt doesn't do either of the above, nor is it accessible, so we are basically
+	at the mercy of whatever the driver wants to do.
+	
+	If the above works, excellent, but if not, there is one other workaround,
+	which is to render the entire scene graph again into an offscreen buffer.
+	The performance tradeoff will need to be analyzed in the application to see
+	if this is faster or slower than glReadPixels. For simple scenes, it is
+	probably faster to render the scene graph again.
+	
+	For the record, the Qt VNC Server commerical add-on for Qt 6.4 does the
+	latter option (at least, that's what was gleaned from the API, which
+	uses QML and thus requires use of the latter). The latter option also doesn't
+	require eglfs, which is probably useful for some.
+	
+	Either of the two workarounds above can be applied with the following
+	definition.
+	0 - No workaround applied.
+	1 - Execute glReadPixels after frameSwapped instead of afterRendering
+	2 - Call QQuickWindow::grabWindow instead of using glReadPixels
+*/
+#define EGL_STALE_FRAMEBUFFER_WORKAROUND 2
+
+#if EGL_STALE_FRAMEBUFFER_WORKAROUND == 2
+#include <QQuickWindow>
+#endif
+
 namespace
 {
     /*
@@ -155,14 +199,29 @@ void VncServer::addClient( qintptr fd )
 
     if ( m_window && !m_grabConnectionId )
     {
+#if EGL_STALE_FRAMEBUFFER_WORKAROUND == 1
+		/*
+			The framebuffer will go out-of-scope after the signal ends,
+			so we must use DirectConnection here.
+		*/
+		m_grabConnectionId = QObject::connect( m_window, SIGNAL(frameSwapped()),
+            this, SLOT(updateFrameBuffer()), Qt::DirectConnection );
+#elif EGL_STALE_FRAMEBUFFER_WORKAROUND == 2
+		/*
+			QQuickWindow::grabWindow must be called from the GUI thread, and not
+			the scene graph rendering thread, so we must use QueuedConnection.
+		*/
+		m_grabConnectionId = QObject::connect( m_window, SIGNAL(frameSwapped()),
+            this, SLOT(updateFrameBuffer()), Qt::QueuedConnection );
+#else
         /*
             afterRendering is from the scene graph thread, so we
             need a Qt::DirectConnection to avoid, that the image is
             already gone, when being scheduled from a Qt::QQueuedConnection !
          */
-
         m_grabConnectionId = QObject::connect( m_window, SIGNAL(afterRendering()),
             this, SLOT(updateFrameBuffer()), Qt::DirectConnection );
+#endif
 
         QMetaObject::invokeMethod( m_window, "update" );
     }
@@ -210,7 +269,7 @@ static inline bool isOpenGL12orBetter( const QOpenGLContext* context )
     return ( fmt.majorVersion() >= 2 ) || ( fmt.minorVersion() >= 2 );
 }
 
-static void grabWindow( QImage& frameBuffer )
+static void grabWindow( QWindow* window, QImage& frameBuffer )
 {
     QElapsedTimer timer;
 
@@ -264,11 +323,29 @@ static void grabWindow( QImage& frameBuffer )
 #else
     // avoiding native OpenGL calls
 
+    const auto format = frameBuffer.format();
+
+#if EGL_STALE_FRAMEBUFFER_WORKAROUND == 2
+	auto qqWindow = dynamic_cast<QQuickWindow *>(window);
+	if (qqWindow != nullptr)
+	{
+		frameBuffer = qqWindow->grabWindow();
+	}
+	else
+	{
+		// If not a QQuickWindow, fallback to the default case.
+#else
+	Q_UNUSED(window);
+#endif
+
     extern QImage qt_gl_read_framebuffer(
         const QSize&, bool alpha_format, bool include_alpha );
-
-    const auto format = frameBuffer.format();
+		
     frameBuffer = qt_gl_read_framebuffer( frameBuffer.size(), false, false );
+
+#if EGL_STALE_FRAMEBUFFER_WORKAROUND == 2
+	}
+#endif
 
     if ( frameBuffer.format() != format )
     {
@@ -307,7 +384,7 @@ void VncServer::updateFrameBuffer()
             m_frameBuffer = QImage( size, QImage::Format_RGB32 );
         }
 
-        grabWindow( m_frameBuffer );
+        grabWindow( m_window, m_frameBuffer );
     }
 
     const QRect rect( 0, 0, m_frameBuffer.width(), m_frameBuffer.height() );
